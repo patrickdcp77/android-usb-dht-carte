@@ -1,0 +1,3 @@
+com.example.myapplication.map
+string app_name
+style Theme_MyApplication

@@ -58,4 +58,9 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     implementation("com.github.mik3y:usb-serial-for-android:3.5.1")
+    implementation(project(":core"))
+
+    // Room/SQLite (utilisé par le ContentProvider dans :app)
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.sqlite:sqlite:2.4.0")
 }

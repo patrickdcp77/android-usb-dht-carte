@@ -1,4 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <application>
+        <!--
+          IMPORTANT:
+          Le provider de partage doit être déclaré UNIQUEMENT dans l'app capteur (:app).
+          Sinon, si :core le déclare, il est aussi fusionné dans :appmap et l'app carte expose
+          son propre provider + sa propre DB (vide) => Mesures:0.
+
+          Voir: app/src/main/java/.../provider/MeasurementsProvider.kt
+        -->
+    </application>
+
 </manifest>

@@ -38,6 +38,13 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import androidx.core.content.ContextCompat
+import com.example.core.db.MeasurementEntity
+import com.example.core.db.MeasurementRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity(), SerialInputOutputManager.Listener {
 
@@ -88,43 +95,69 @@ class MainActivity : ComponentActivity(), SerialInputOutputManager.Listener {
         }
     }
 
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val keepLastMeasurements = 3000
+    private lateinit var measurementRepository: MeasurementRepository
+
+    private val saveIntervalMs = 10_000L
+    @Volatile private var lastSavedAtMs: Long = 0L
+
+    private val fatalErrorState = mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
-        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+        try {
+            measurementRepository = MeasurementRepository.getInstance(this)
 
-        val filter = IntentFilter(actionUsbPermission)
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(
-                usbPermissionReceiver,
-                filter,
-                usbPermissionBroadcastPermission,
-                null,
-                Context.RECEIVER_NOT_EXPORTED
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            @SuppressLint("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(
-                usbPermissionReceiver,
-                filter,
-                usbPermissionBroadcastPermission,
-                null
-            )
-        }
+            usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
+            fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
 
-        setContent {
-            MaterialTheme {
-                SensorScreen(
-                    status = statusState.value,
-                    temp = tempState.value,
-                    hum = humState.value,
-                    raw = rawState.value,
-                    location = locationState.value,
-                    locationStatus = locationStatusState.value
+            val filter = IntentFilter(actionUsbPermission)
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(
+                    usbPermissionReceiver,
+                    filter,
+                    usbPermissionBroadcastPermission,
+                    null,
+                    Context.RECEIVER_NOT_EXPORTED
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                @SuppressLint("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(
+                    usbPermissionReceiver,
+                    filter,
+                    usbPermissionBroadcastPermission,
+                    null
                 )
             }
+
+            setContent {
+                MaterialTheme {
+                    val fatal = fatalErrorState.value
+                    if (fatal != null) {
+                        Text(text = "Erreur fatale: $fatal")
+                    } else {
+                        SensorScreen(
+                            status = statusState.value,
+                            temp = tempState.value,
+                            hum = humState.value,
+                            raw = rawState.value,
+                            location = locationState.value,
+                            locationStatus = locationStatusState.value
+                        )
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            fatalErrorState.value = t.toString()
+            setContent {
+                MaterialTheme {
+                    Text(text = "Erreur fatale: ${fatalErrorState.value}")
+                }
+            }
+            return
         }
 
         ensureLocationPermissionThenFetch()
@@ -149,6 +182,7 @@ class MainActivity : ComponentActivity(), SerialInputOutputManager.Listener {
         } catch (_: Exception) {
         }
         executor.shutdownNow()
+        appScope.cancel()
     }
 
     private fun setStatus(s: String) {
@@ -257,6 +291,26 @@ class MainActivity : ComponentActivity(), SerialInputOutputManager.Listener {
 
         if (t != null) tempState.value = t
         if (h != null) humState.value = h
+
+        val loc = locationState.value
+        if (loc != null && (t != null || h != null)) {
+            val now = System.currentTimeMillis()
+            if (now - lastSavedAtMs >= saveIntervalMs) {
+                lastSavedAtMs = now
+
+                val entity = MeasurementEntity(
+                    timestampMs = now,
+                    latitude = loc.latitude,
+                    longitude = loc.longitude,
+                    temperatureC = t,
+                    humidityPct = h,
+                    raw = line
+                )
+                appScope.launch {
+                    measurementRepository.addAndTrim(entity, keepLastMeasurements)
+                }
+            }
+        }
 
         if (line.startsWith("ERR=")) setStatus("Sensor error: $line")
     }
