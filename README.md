@@ -1,185 +1,210 @@
-# Android USB DHT Sensor + Géolocalisation (MyApplication2)
+# Android USB DHT Capteur + Géolocalisation + Carte OSM (projet multi-modules)
 
-Cette app Android lit en USB-Serial (OTG) les mesures d’un capteur (ex: DHT via ESP8266/ESP32) et les affiche **avec la localisation du smartphone** (latitude/longitude).
+Ce dépôt contient **2 applications Android** qui partagent un même module `:core` :
 
-## Mini schéma ASCII (architecture)
+- **App capteur** (`:app`) : lit en **USB-Serial (OTG)** des trames du capteur (ex: DHT via ESP8266/ESP32), récupère la **localisation**, affiche en temps réel et **enregistre** les mesures.
+- **App carte** (`:appmap`) : affiche une **carte OpenStreetMap (osmdroid)** centrée sur la position du smartphone et matérialise les mesures enregistrées (dernier point **rouge**, historiques **verts**).
 
-### Architecture Gradle (aujourd’hui)
+Les données sont partagées via un **ContentProvider** exposé par l’app capteur.
 
-```
-MyApplication2
-└─ :app  (application)
-   ├─ UI Compose (SensorScreen)
-   ├─ USB/Serial (usb-serial-for-android)
-   └─ Location (play-services-location)
-```
+---
 
-### Architecture recommandée si tu veux 2 apps (plus tard)
+## Mini schéma ASCII “architecture”
 
 ```
-MyApplication2
-├─ :core  (library)   -> USB + parsing + modèles de données
-├─ :app   (application) -> UI/écran "capteur"
-└─ :app2  (application) -> UI/écran "carto / logger / autre"
-
-:app  -> dépend de :core
-:app2 -> dépend de :core
+                       (USB OTG)                     (GPS / Wi‑Fi / Cell)
+[ESP / Capteur]  ------------------>  :app MainActivity  <-----------------
+        |                                  |
+        |                                  |  (rate limiter 10s)
+        |                                  v
+        |                            Room DB (:core)
+        |                                  |
+        |                                  |  notifyChange(content://…)
+        |                                  v
+        |                   ContentProvider (déclaré dans :app)
+        |                 content://com.example.myapplication.measurements/latest
+        |                                  |
+        |                                  v
+        +--------------------------->  :appmap MapActivity (Refresh / Observer)
+                                           |
+                                           v
+                                      Carte OSM (osmdroid)
+                              points = mesures (dernier rouge, autres verts)
 ```
 
-### Flux runtime (lecture + affichage)
+---
 
+## Modules Gradle (ce qu’il faut lancer)
+
+Déclarés dans `settings.gradle.kts` :
+- `:app` (application) → **Capteur DHT + USB + Location + stockage + provider**
+- `:appmap` (application) → **Carte OSM + lecture provider + affichage points**
+- `:core` (library) → **Room (DB/DAO/Entity/Repository) + code partagé**
+
+Dans Android Studio, tu choisis le module à exécuter via la configuration **Run/Debug** (ou le menu déroulant). Sinon en Gradle :
+
+```powershell
+# APK debug app capteur
+.\gradlew.bat :app:assembleDebug
+
+# APK debug app carte
+.\gradlew.bat :appmap:assembleDebug
 ```
-[Capteur / ESP] --USB OTG--> [Android USB Manager]
-      |                           |
-      |                           +--> Permission USB (broadcast USB_PERMISSION)
-      |
-      +-- "T=..;H=..\n" --> [SerialInputOutputManager] --> [Parser] ---> (tempState/humState/rawState)
 
-[GPS / Wi‑Fi / Cell] ---> [FusedLocationProviderClient] ---> (locationState)
+---
 
-(states) ----> [UI Compose: SensorScreen]
-```
+## Flux de données (important)
 
-## Vue d’ensemble (comment ça s’articule)
+### 1) App capteur (`:app`)
+Fichiers clés :
+- `app/src/main/java/com/example/myapplication/MainActivity.kt`
 
-### Flux principal
-1. **USB OTG branché** → Android détecte un périphérique USB.
-2. L’app **demande la permission USB** (broadcast `USB_PERMISSION`).
-3. Une fois la permission accordée, l’app ouvre le port série via la lib `usb-serial-for-android`.
-4. Les données arrivent en continu → on reconstruit des lignes terminées par `\n` → parsing `T=...;H=...`.
-5. En parallèle, l’app demande la **permission de localisation** et récupère une position via **Fused Location Provider**.
-6. UI Jetpack Compose affiche **Temp/Hum + Lat/Lon**.
+Flux :
+1. Détection driver USB-Serial (`UsbSerialProber`) + permission USB.
+2. Lecture bytes via `SerialInputOutputManager`.
+3. Reconstruction de lignes `\n` puis parsing `T=…;H=…`.
+4. Récupération localisation via `FusedLocationProviderClient`.
+5. **Enregistrement en base (Room)** d’une mesure horodatée *si* :
+   - on a une localisation, et
+   - au moins une valeur (T ou H), et
+   - **rate limiter** : `now - lastSavedAtMs >= 10_000` (10 secondes)
+6. Après insertion : `contentResolver.notifyChange(MeasurementsProvider.CONTENT_URI, null)`
+   → permet à l’app carte de se rafraîchir.
 
-## Structure du projet (dossiers / fichiers)
+### 2) Stockage (module `:core`)
+Fichiers clés :
+- `core/src/main/java/com/example/core/db/MeasurementEntity.kt`
+- `core/src/main/java/com/example/core/db/MeasurementDao.kt`
+- `core/src/main/java/com/example/core/db/AppDatabase.kt`
+- `core/src/main/java/com/example/core/db/MeasurementRepository.kt`
+
+Rôle :
+- Stocker les mesures (timestamp + lat/lon + température + humidité + raw).
+- Garder un historique limité (ex: **3000 dernières** mesures) via `trimToLatest(keepLast)`.
+
+### 3) Partage inter-app (ContentProvider)
+Fichier clé :
+- `app/src/main/java/com/example/myapplication/provider/MeasurementsProvider.kt`
+
+Contrat :
+- Authority : `com.example.myapplication.measurements`
+- URI :
+  - `content://com.example.myapplication.measurements/latest?limit=3000`
+
+Important :
+- Le provider est **déclaré dans le Manifest de `:app` uniquement** :
+  - `app/src/main/AndroidManifest.xml`
+- `core/src/main/AndroidManifest.xml` contient volontairement un commentaire indiquant de **NE PAS** déclarer le provider dans `:core`.
+  Sinon il serait fusionné dans `:appmap` et la carte lirait une DB “vide” → `Mesures:0`.
+
+### 4) App carte (`:appmap`)
+Fichier clé :
+- `appmap/src/main/java/com/example/myapplication/map/MapActivity.kt`
+
+Flux :
+1. Récupère la localisation (pour centrer la carte).
+2. Lit les mesures via `contentResolver.query()` sur le provider.
+3. Affiche les points sur la carte osmdroid :
+   - **dernier point** (le plus récent) en **rouge**
+   - les autres en **vert**
+4. Rafraîchissement :
+   - bouton **Rafraîchir**
+   - et/ou `ContentObserver` (si `notifyChange` est reçu)
+
+---
+
+## Rôle des principaux fichiers / dossiers
 
 ### Racine
-- `settings.gradle.kts`
-  - Déclare les modules Gradle (ex: `:app`, et plus tard `:core`, `:app2` si tu ajoutes une 2ᵉ app).
-- `build.gradle.kts`
-  - Build Gradle **global** (plugins/versions si nécessaire).
-- `gradle.properties`
-  - Propriétés Gradle (perf, AndroidX, etc.).
-- `gradlew` / `gradlew.bat`
-  - Wrapper Gradle (recommandé pour compiler de manière reproductible).
-- `gradle/wrapper/gradle-wrapper.properties`
-  - Version de Gradle utilisée par le wrapper.
-- `gradle/libs.versions.toml`
-  - *Version Catalog* : centralise les versions des libs/plugins utilisés via `libs.xxx`.
-- `local.properties`
-  - **Local à ta machine** (chemin du SDK, etc.). Ne pas partager.
-- `README.md`
-  - Ce document.
+- `settings.gradle.kts` : liste les modules (`:app`, `:core`, `:appmap`) et les repositories (Google/MavenCentral/Jitpack).
+- `build.gradle.kts` : configuration Gradle “racine” (plugins/versions).
+- `gradle/libs.versions.toml` : Version Catalog (versions dépendances/plugins).
+- `gradlew` / `gradlew.bat` + `gradle/wrapper/*` : Gradle Wrapper (indispensable pour cloner/build ailleurs).
 
-### Module `app/` (l’application)
-- `app/build.gradle.kts`
-  - Configuration Android (namespace, sdk, compose) + dépendances.
-  - Dépendances importantes :
-    - `com.github.mik3y:usb-serial-for-android` → communication série USB.
-    - `com.google.android.gms:play-services-location` → localisation (FusedLocationProviderClient).
+### `app/`
+- `app/src/main/AndroidManifest.xml` : permissions + déclaration du provider + launcher activity.
+- `MainActivity.kt` : USB + parsing + location + stockage Room + notifyChange.
 
-- `app/src/main/AndroidManifest.xml`
-  - Déclare les permissions et composants Android.
-  - Ici notamment :
-    - `ACCESS_COARSE_LOCATION`, `ACCESS_FINE_LOCATION` (+ optionnel `ACCESS_BACKGROUND_LOCATION`)
-    - `uses-feature android.hardware.usb.host`
+### `appmap/`
+- `appmap/src/main/AndroidManifest.xml` : permissions + launcher activity (MapActivity).
+- `MapActivity.kt` : carte OSM + lecture provider + overlay markers.
 
-- `app/src/main/java/com/example/myapplication/MainActivity.kt`
-  - **Fichier central**.
-  - Rôles :
-    - Gère l’USB : demande permission, ouvre le port série, lit les données.
-    - Gère la localisation : demande permission, récupère une position (current location + fallback update).
-    - Contient l’UI Compose (`SensorScreen`) : affiche status, température, humidité, lat/lon, trame raw.
+### `core/`
+- `core/src/main/java/com/example/core/db/*` : DB Room et repository.
+- `core/src/main/AndroidManifest.xml` : volontairement “vide” (commentaire important sur le provider).
 
-- `app/src/main/res/`
-  - Ressources Android.
-  - `values/strings.xml` : textes (nom app, etc.).
-  - `values/themes.xml` : thème.
-  - `mipmap-*/` : icônes.
-  - `xml/backup_rules.xml`, `xml/data_extraction_rules.xml` : backup/data extraction.
+---
 
-### Dossier `.idea/`
-- Config Android Studio/IntelliJ. Peut être commit selon ton usage, mais souvent on garde juste le minimum.
+## Additif : clonage sur une autre machine (Android Studio)
 
-### Dossier `app/build/`
-- Généré par Gradle (ne pas commit).
+### Objectif
+Pouvoir cloner le dépôt GitHub et l’ouvrir dans Android Studio **sans copier de fichiers locaux**.
 
-## Détails techniques importants
+### Ce qui est normal après clonage
+- `local.properties` **n’est pas dans Git** (et ne doit pas y être). Android Studio le recrée avec `sdk.dir=...`.
+- Les dossiers `**/build/**` ne sont **pas** versionnés (générés par Gradle).
 
-### 1) Permission USB (BroadcastReceiver)
-- L’app utilise une action custom : `com.example.myapplication.USB_PERMISSION`.
-- Android envoie un broadcast au moment où l’utilisateur accepte/refuse la permission.
-- Sur Android 13+ (API 33), `registerReceiver` doit préciser `RECEIVER_NOT_EXPORTED` ou `RECEIVER_EXPORTED`.
+### Prérequis côté PC
+- Android Studio (recommandé)
+- Android SDK installé (Android Studio le gère)
+- JDK : idéalement celui intégré à Android Studio (`jbr`)
 
-### 2) Lecture série USB
-- Lib : `usb-serial-for-android`.
-- Étapes :
-  - `UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)`
-  - `driver.ports.firstOrNull()`
-  - `port.open(connection)` + `port.setParameters(115200, 8, STOPBITS_1, PARITY_NONE)`
-  - `SerialInputOutputManager` pour recevoir les bytes en callback.
+### 1) Cloner
+```powershell
+git clone https://github.com/patrickdcp77/android-usb-dht-carte.git
+cd android-usb-dht-carte
+```
 
-### 3) Parsing des mesures
-- Le code attend une ligne complète (terminée par `\n`).
-- Format recommandé côté microcontrôleur :
-  - `T=23.4;H=45.6\n`
+### 2) Ouvrir dans Android Studio
+- `File > Open…` puis sélectionner le dossier du projet.
+- Attendre la synchro Gradle.
 
-### 4) Localisation
-- API utilisée : `FusedLocationProviderClient` (Google Play Services).
-- Pourquoi `lastLocation` ne suffit pas : peut être `null` si aucun fix récent.
-- Stratégie :
-  - `getCurrentLocation(...)`
-  - si `null` → `requestLocationUpdates(... maxUpdates=1)`
+### 3) Si Gradle affiche “JAVA_HOME is not set” (Windows)
+Sur certaines machines/terminaux, Gradle en ligne de commande a besoin de `JAVA_HOME`.
 
-## Prérequis (PC Windows)
+Exemple (session courante PowerShell) :
+```powershell
+$Env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
+& "$Env:JAVA_HOME\bin\java.exe" -version
+```
 
-### Java / Gradle (important)
-Si Gradle dit `JAVA_HOME is not set`, pointe `JAVA_HOME` vers le JDK d’Android Studio.
-Sur ta machine, le JDK existe ici :
-- `C:\Program Files\Android\Android Studio\jbr`
-
-Commandes PowerShell (à copier/coller) :
-
+Pour le rendre permanent (optionnel) :
 ```powershell
 setx JAVA_HOME "C:\Program Files\Android\Android Studio\jbr"
-setx PATH "%PATH%;%JAVA_HOME%\bin"
 ```
 
-Puis ferme/réouvre le terminal (ou Android Studio) et vérifie :
-
+### 4) Build rapide (sans Android Studio)
 ```powershell
-java -version
-```
-
-## Compiler / lancer
-
-```powershell
-# depuis la racine du projet
 .\gradlew.bat :app:assembleDebug
+.\gradlew.bat :appmap:assembleDebug
 ```
 
-## GitHub (sauvegarder le projet)
+### 5) Lancer sur smartphone
+- Branche le téléphone (mode développeur + débogage USB)
+- Dans Android Studio, sélectionne **quelle app lancer** (`:app` ou `:appmap`) puis Run.
 
-Étapes typiques :
-1. `git add .`
-2. `git commit -m "..."`
-3. `git push -u origin main`
+---
 
-Si Git demande ton identité :
+## .gitignore (important)
+Ton `.gitignore` ignore déjà les essentiels :
+- `local.properties`
+- `**/build/`
 
-```powershell
-git config --global user.name "Ton Nom"
-git config --global user.email "toi@example.com"
-```
+Si tu vois des fichiers `build/**` dans GitHub, c’est qu’ils ont été commit avant d’être ignorés.
+La correction est alors : `git rm -r --cached <module>/build` + commit.
 
-## Évolutions recommandées (2 apps + code partagé)
-Si tu veux 2 apps qui réutilisent le même code USB/parsing :
-- créer un module **library** `:core` (USB + parsing)
-- créer un second module **application** `:app2`
-- `:app` et `:app2` dépendent de `:core`
-
-Bénéfices : une seule implémentation USB/parsing, deux UIs différentes.
+---
 
 ## Dépannage rapide
-- **Pas de coordonnées** : localisation désactivée dans les réglages, pas de fix GPS (intérieur), permission non accordée.
-- **USB non détecté** : vérifier OTG, câble, alimentation, périphérique compatible.
-- **Aucune mesure** : vérifier baud rate (115200), format `T=...;H=...\n`.
+
+- **Carte OK mais “Mesures: 0”** :
+  - vérifier que l’app capteur a bien enregistré des mesures (ouvrir `:app` et attendre)
+  - vérifier que le provider est déclaré **uniquement** dans `:app`.
+
+- **Points invisibles sur la carte** :
+  - vérifier qu’il y a des mesures
+  - vérifier que les points ont une taille d’icône suffisante (dans `MapActivity` on fixe la taille du cercle).
+
+- **L’app capteur ne “log” pas en arrière-plan** :
+  - actuellement l’app enregistre quand le flux USB/l’app est active.
+  - un vrai logging arrière-plan nécessitera un Service/Foreground Service/WorkManager (à faire plus tard).
