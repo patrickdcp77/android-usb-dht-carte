@@ -3,12 +3,15 @@ package com.example.myapplication.map
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
+import android.database.ContentObserver
 import android.database.Cursor
 import android.location.Location
 import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -26,6 +29,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import android.graphics.drawable.ShapeDrawable
+import android.graphics.drawable.shapes.OvalShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -49,6 +55,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import android.util.Log
+import android.graphics.drawable.ColorDrawable
 
 class MapActivity : ComponentActivity() {
 
@@ -69,6 +76,16 @@ class MapActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
             fetchLocationOnce()
         }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val providerObserver = object : ContentObserver(mainHandler) {
+        override fun onChange(selfChange: Boolean) {
+            super.onChange(selfChange)
+            // Un insert côté app capteur déclenche notifyChange -> on se rafraîchit.
+            loadLatest()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -93,28 +110,52 @@ class MapActivity : ComponentActivity() {
         ensureLocationPermissionThenFetch()
         loadLatest()
 
-        // Auto-refresh: recharge périodiquement pour afficher les nouvelles mesures
-        appScope.launch {
-            while (true) {
-                delay(5_000)
-                loadLatestViaProvider()
-            }
+        // Observe les changements du provider au lieu de dépendre du polling.
+        try {
+            contentResolver.registerContentObserver(
+                MEASUREMENTS_LATEST_URI,
+                true,
+                providerObserver
+            )
+        } catch (_: Throwable) {
+            // Si l'observer échoue, le bouton Refresh reste utilisable.
         }
+
+        // (optionnel) on garde un polling léger en fallback si besoin
+        // appScope.launch {
+        //     while (true) {
+        //         delay(10_000)
+        //         loadLatest()
+        //     }
+        // }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        try {
+            contentResolver.unregisterContentObserver(providerObserver)
+        } catch (_: Throwable) {
+        }
         appScope.cancel()
     }
 
     private fun loadLatest() {
         appScope.launch {
-            loadLatestViaProvider()
+            val result = loadLatestOnceViaProvider()
+            runOnUiThread {
+                providerDiagState.value = result.diag
+                measurementsState.value = result.list
+            }
         }
     }
 
-    private suspend fun loadLatestViaProvider() {
-        try {
+    private data class ProviderResult(
+        val diag: String,
+        val list: List<MeasurementEntity>
+    )
+
+    private fun loadLatestOnceViaProvider(): ProviderResult {
+        return try {
             val uri = MEASUREMENTS_LATEST_URI.buildUpon()
                 .appendQueryParameter("limit", keepLastMeasurements.toString())
                 .build()
@@ -125,16 +166,11 @@ class MapActivity : ComponentActivity() {
             val msg = "Provider: OK (rows=${list.size}) @${System.currentTimeMillis()}"
             Log.d("MapActivity", msg)
 
-            runOnUiThread {
-                providerDiagState.value = msg
-                measurementsState.value = list
-            }
+            ProviderResult(diag = msg, list = list)
         } catch (t: Throwable) {
             val msg = "Provider: ERROR ${t::class.java.simpleName}: ${t.message}"
             Log.e("MapActivity", msg, t)
-            runOnUiThread {
-                providerDiagState.value = msg
-            }
+            ProviderResult(diag = msg, list = emptyList())
         }
     }
 
@@ -314,10 +350,21 @@ private fun OsmMap(
 
             val df = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
 
+            // Les mesures arrivent déjà triées DESC par timestamp depuis le provider.
+            // On colore la première (la plus récente) en rouge, les autres en vert.
+            val latestId = measurements.firstOrNull()?.id
+
+            // Taille du point (en pixels) - assez grand pour être visible.
+            val dotSizePx = (context.resources.displayMetrics.density * 14f).toInt().coerceAtLeast(8)
+
             for (m in measurements) {
+                val isLatest = latestId != null && m.id == latestId
+
+                val colorInt = if (isLatest) 0xFFD32F2F.toInt() else 0xFF2E7D32.toInt()
+
                 val marker = Marker(mapView).apply {
                     position = GeoPoint(m.latitude, m.longitude)
-                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
 
                     val t = m.temperatureC?.let { String.format(Locale.US, "%.1f", it) } ?: "--"
                     val h = m.humidityPct?.let { String.format(Locale.US, "%.1f", it) } ?: "--"
@@ -325,6 +372,13 @@ private fun OsmMap(
 
                     title = "T=$t°C  H=$h%"
                     subDescription = "$ts\n${m.raw}"
+
+                    // Icône: petit cercle avec taille explicite (sinon il peut être invisible)
+                    icon = ShapeDrawable(OvalShape()).apply {
+                        paint.color = colorInt
+                        intrinsicWidth = dotSizePx
+                        intrinsicHeight = dotSizePx
+                    }
                 }
                 mapView.overlays.add(marker)
             }

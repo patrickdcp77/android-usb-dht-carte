@@ -13,3 +13,9 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Gradle / Android build outputs
+**/build/
+
+# Local configuration
+local.properties

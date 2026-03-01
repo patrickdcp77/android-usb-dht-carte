@@ -172,7 +172,11 @@ class MainActivity : ComponentActivity(), SerialInputOutputManager.Listener {
 
     override fun onPause() {
         super.onPause()
-        closeSerial()
+        // IMPORTANT:
+        // - Si on ferme l’USB ici, il n’y a plus de nouvelles mesures quand l’app est en arrière-plan.
+        // - Du coup l’app carte ne voit rien de nouveau.
+        // On laisse la connexion ouverte; elle sera fermée en onDestroy().
+        // closeSerial()
     }
 
     override fun onDestroy() {
@@ -183,6 +187,7 @@ class MainActivity : ComponentActivity(), SerialInputOutputManager.Listener {
         }
         executor.shutdownNow()
         appScope.cancel()
+        closeSerial()
     }
 
     private fun setStatus(s: String) {
@@ -308,6 +313,17 @@ class MainActivity : ComponentActivity(), SerialInputOutputManager.Listener {
                 )
                 appScope.launch {
                     measurementRepository.addAndTrim(entity, keepLastMeasurements)
+
+                    // Notifie les observers du provider (app carte) qu’il y a du nouveau.
+                    // Sans ça, l’app carte doit r e9interroger en polling.
+                    try {
+                        contentResolver.notifyChange(
+                            com.example.myapplication.provider.MeasurementsProvider.CONTENT_URI,
+                            null
+                        )
+                    } catch (_: Throwable) {
+                        // Ignore: ce notify est un bonus.
+                    }
                 }
             }
         }
