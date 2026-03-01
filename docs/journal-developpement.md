@@ -186,3 +186,73 @@ git rm -r --cached <module>/build
 - Export CSV / partage.
 - Mode “données simulées” pour tester `:appmap` sur émulateur sans USB.
 - Filtrage des points (par date, par zone, clustering si beaucoup de points).
+
+---
+
+## 7) Questions fréquentes à se poser / décisions clés
+
+Cette section sert de guide quand on veut **améliorer** le projet, éviter de casser ce qui marche, et garder une trajectoire claire.
+
+### 7.1 Données & protocole capteur
+- **Format des trames** : est-ce qu’on fige un format stable ? (ex: `T=..;H=..` + `\n`)
+  - Décision : documenter le format et gérer proprement les valeurs manquantes.
+- **Accusé de réception / erreurs** : est-ce que l’ESP renvoie `OK` / `ERR=...` ?
+  - Décision : standardiser les erreurs pour le debug.
+- **Bidirectionnel** : veut-on que le téléphone envoie des commandes à l’ESP ?
+  - Décision : définir un mini protocole “commandes” (ex: `SET_RATE=10\n`, `SYNC_TIME=...\n`).
+
+### 7.2 Fréquence d’enregistrement (rate limiter)
+- **10 secondes, est-ce le bon compromis ?**
+  - Décision : rendre la valeur configurable (UI / settings / constante) si besoin.
+- **Sauver uniquement si la valeur change ?**
+  - Décision : option “save if delta > seuil” pour éviter les doublons.
+
+### 7.3 Localisation
+- **Précision voulue** : fine (GPS) ou coarse (réseau) ?
+  - Décision : utiliser FINE si possible, sinon fallback COARSE.
+- **Que faire si location = null ?**
+  - Décision actuelle : ne pas enregistrer (sinon points incorrects). Alternative : enregistrer sans GPS et compléter plus tard.
+
+### 7.4 Arrière-plan / continuité des mesures
+- **Doit-on logger sans écran ouvert ?**
+  - Décision : si OUI → passer à un **Foreground Service** (avec notification) pour éviter que l’OS stoppe l’app.
+  - Décision : si NON → garder l’app simple, et accepter que les mesures arrivent surtout au premier plan.
+
+### 7.5 Stockage / taille de la base
+- **3000 mesures, ça représente combien de temps ?**
+  - À 10s : ~8h20 d’historique.
+- **Politique de rétention** : par nombre (actuel) ou par durée (ex: dernier 7 jours) ?
+  - Décision : garder `keepLast` simple, ou ajouter “trim par date”.
+
+### 7.6 Carte / UX
+- **Trop de points** : à partir de quand il faut regrouper (clustering) ?
+  - Décision : ajouter clustering si > ~500 points visibles.
+- **Interaction** : clic sur point OK, mais veut-on une liste / recherche / filtre ?
+  - Décision : ajouter filtre par date, ou sélection d’une fenêtre de temps.
+- **Couleurs** : dernier rouge / autres verts (fait). Veut-on une échelle de couleur par température ?
+
+### 7.7 Partage inter-app (ContentProvider)
+- **Sécurité** : le provider est `exported=true` → n’importe quelle app pourrait lire.
+  - Décision “projet perso” : OK.
+  - Décision “prod” : protéger avec permission signature / restreindre / autre mécanisme.
+- **Contrat d’URI** : documenter clairement `content://…/latest?limit=...`.
+
+### 7.8 Débogage / observabilité
+- **Logs** : quelles lignes de log sont indispensables ?
+  - Décision : logs sur (permission USB, open port, parse, insert DB, provider query) + option niveau log.
+- **Écran diagnostic** : utile pour savoir si l’app carte lit bien le provider.
+  - Décision : conserver `providerDiagState` côté `:appmap`.
+
+### 7.9 Test & robustesse
+- **Test sans USB (émulateur)** : veut-on un mode “simulateur” ?
+  - Décision : ajouter un mode DEBUG qui génère des mesures fictives.
+- **Tests unitaires** : parsing et trimming sont testables.
+  - Décision : ajouter 2–3 tests (parser + rate limiter + trim).
+
+### 7.10 Roadmap (ordre logique)
+Si on veut améliorer sans risque :
+1. Mode “simulateur” (test rapide sur émulateur)
+2. Export CSV
+3. Clustering carte
+4. Foreground Service (logging stable en arrière-plan)
+5. Sécurisation provider (si usage "prod")
